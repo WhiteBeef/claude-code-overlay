@@ -568,13 +568,16 @@ class Settings(QFrame):
         sessions.addItem("Most important", "top")
         sessions.addItem("All sessions", "all")
         sessions.setCurrentIndex(0 if cfg["sessions"] == "top" else 1)
-        sessions.currentIndexChanged.connect(lambda _i: self.set(("sessions",), sessions.currentData()))
+        sessions.currentIndexChanged.connect(lambda _i: self.set_sessions(sessions.currentData()))
         form.addRow("Show", sessions)
 
         for key, text in (("five_hour", "5-hour limit, %"), ("seven_day", "Weekly limit, %"),
                           ("reset_in", "Time to 5-hour reset"), ("elapsed", "Elapsed time"),
                           ("tool", "Current tool"), ("project", "Project name")):
-            form.addRow(self.check(text, ("show", key)))
+            box = self.check(text, ("show", key))
+            form.addRow(box)
+        self.project = box
+        self.sync_project()
         form.addRow(self.check("Answer prompts from the overlay", ("interactive", "enabled")))
 
         controls = QComboBox()
@@ -595,6 +598,19 @@ class Settings(QFrame):
         row.addWidget(edit)
         row.addWidget(reset)
         form.addRow(row)
+
+    def set_sessions(self, mode):
+        self.set(("sessions",), mode)
+        self.sync_project()
+
+    def sync_project(self):
+        # "all" mode always shows the project name, so the box can't turn it off there
+        forced = self.overlay.config["sessions"] == "all"
+        self.project.blockSignals(True)
+        self.project.setChecked(forced or bool(self.get(("show", "project"))))
+        self.project.blockSignals(False)
+        self.project.setEnabled(not forced)
+        self.project.setToolTip("Always shown with all sessions" if forced else "")
 
     def check(self, text, path):
         box = QCheckBox(text)
@@ -725,6 +741,7 @@ class Overlay(QWidget):
             }}
             #settings {{ border-color: rgba(255, 255, 255, 40); }}
             QLabel, QCheckBox {{ color: {c['text']}; font-size: {font}pt; }}
+            QCheckBox:disabled {{ color: {c['dim']}; }}
             QLabel#caption {{ color: {c['waiting']}; font-weight: bold; }}
             QLabel#heading {{ font-weight: bold; }}
             QLabel#code {{ font-family: monospace; color: {c['text']}; }}
