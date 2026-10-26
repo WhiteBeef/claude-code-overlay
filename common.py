@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 try:
     import psutil
@@ -257,3 +258,25 @@ def was_interrupted(transcript):
         pass
     _interrupt_cache[transcript] = (mtime, result)
     return result, mtime
+
+
+def last_response_time(transcript):
+    """Epoch time of the last assistant message in the transcript, 0 if unknown."""
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read()
+    except (OSError, TypeError):
+        return 0
+    for line in reversed(tail.splitlines()):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "assistant":
+            try:
+                return datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (KeyError, AttributeError, ValueError):
+                return 0
+    return 0
