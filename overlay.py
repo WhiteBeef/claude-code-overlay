@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tiny always-on-top overlay showing whether Claude Code is working or needs you.
+"""Tiny always-on-top overlay showing whether coding agents are working or need you.
 
-State comes from hook.py (one JSON file per session in ~/.claude/overlay/state) and
-plan limits from statusline.py. Settings live in ~/.claude/overlay/config.json and
-are reloaded as soon as the file changes.
+State comes from hook.py (one JSON file per client and session) and plan limits from
+statusline.py. Settings live in ~/.claude/overlay/config.json and are reloaded as soon
+as the file changes.
 
 Drag to move. A single click shows the gear (settings) and close buttons; right-click
 opens the menu.
@@ -23,6 +23,7 @@ if sys.platform.startswith("linux") and os.environ.get("DISPLAY"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (  # noqa: E402
     ANSWER_DIR,
+    CLIENT_LABELS,
     CONFIG_PATH,
     DEFAULT_CONFIG,
     HEARTBEAT_PATH,
@@ -31,7 +32,9 @@ from common import (  # noqa: E402
     POSITION_PATH,
     STATE_DIR,
     has_busy_child,
+    find_kimi_transcript,
     is_alive,
+    last_kimi_turn_end,
     load_config,
     psutil,
     read_json,
@@ -81,7 +84,9 @@ RAYS = [1.0, 0.8, 0.94, 0.76, 0.98, 0.84, 0.9, 0.78, 1.0, 0.82, 0.92, 0.8]
 # --- data ----------------------------------------------------------------------
 
 
-def hook_alive(request):
+def hook_alive(request: dict) -> bool:
+    if request.get("terminal_only"):
+        return True
     if psutil is None:
         return True
     try:
@@ -110,8 +115,18 @@ def load_sessions():
                     os.remove(p)
             continue
 
+        client = s.get("client", "claude")
+        if client == "kimi":
+            if not s.get("transcript"):
+                session_id = s.get("session_id") or name[5:-5]
+                s["transcript"] = find_kimi_transcript(session_id)
+            ended = last_kimi_turn_end(s.get("transcript"))
+            if s.get("status") == "working" and ended:
+                s["status"], s["since"], s["tool"] = "done", ended, None
+
         interrupted, mtime = False, 0
-        if s.get("status") in ("working", "waiting") or s.get("requests"):
+        if client == "claude" and (
+                s.get("status") in ("working", "waiting") or s.get("requests")):
             interrupted, mtime = was_interrupted(s.get("transcript"))
             interrupted = interrupted and mtime > s.get("updated", 0)
         s["requests"] = [
@@ -155,6 +170,10 @@ def send_answer(request_id, answer):
 
 def project_name(session):
     return os.path.basename((session.get("cwd") or "").rstrip("/\\")) or "?"
+
+
+def client_name(session: dict) -> str:
+    return CLIENT_LABELS.get(session.get("client", "claude"), "Claude")
 
 
 def fmt_duration(seconds):
@@ -219,6 +238,11 @@ class Pill(QWidget):
         show = cfg["show"]
         s, status = self.session or {}, self.status()
         parts = []
+        active_clients = {item.get("client", "claude") for item in self.overlay.sessions}
+        if self.session and len(active_clients) > 1:
+            parts.append((client_name(s), colors["accent"]))
+        if s.get("client") == "kimi" and s.get("overlay_auto"):
+            parts.append(("Auto", colors["done"]))
         if self.session and (show["project"] or cfg["sessions"] == "all"):
             parts.append((project_name(s), colors["text"]))
         if show["elapsed"]:
@@ -289,7 +313,7 @@ class Pill(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
 
-        # background, with a pulsing border while Claude waits for you
+        # background, with a pulsing border while the agent waits for you
         bg = QColor(colors["background"])
         bg.setAlphaF(o.config["opacity"])
         path = QPainterPath()
@@ -439,7 +463,7 @@ class Pill(QWidget):
 
 
 class RequestCard(QFrame):
-    """Buttons for a permission prompt or a question Claude is waiting on."""
+    """Buttons for a permission prompt or a question an agent is waiting on."""
 
     def __init__(self, overlay, session, request):
         super().__init__()
@@ -454,13 +478,25 @@ class RequestCard(QFrame):
 
         head = request["tool"] if request["kind"] == "permission" else (
             "Question" if request["kind"] == "question" else "Plan")
+        if len({item.get("client", "claude") for item in overlay.sessions}) > 1:
+            head = f"{client_name(session)} · {head}"
         if overlay.config["sessions"] == "all" or len(overlay.sessions) > 1:
             head += f" · {project_name(session)}"
         caption = QLabel(head)
         caption.setObjectName("caption")
         layout.addWidget(caption)
 
-        if request["kind"] == "question":
+        if request.get("terminal_only"):
+            title = QLabel(self.shorten(request["title"]))
+            title.setObjectName("code")
+            title.setWordWrap(True)
+            title.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(title)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(self.button("Answer in terminal", "ghost", {"action": "defer"}))
+            layout.addLayout(row)
+        elif request["kind"] == "question":
             self.build_questions(layout, request["questions"])
         else:
             title = QLabel(self.shorten(request["title"]))
@@ -471,10 +507,12 @@ class RequestCard(QFrame):
             row = QHBoxLayout()
             row.setSpacing(int(6 * overlay.scale))
             plan = request["kind"] == "plan"
-            row.addWidget(self.button("Approve" if plan else "Allow", "primary", {"action": "allow"}))
+            kimi = request.get("client") == "kimi"
+            row.addWidget(self.button("Approve" if plan or kimi else "Allow", "primary", {"action": "allow"}))
             if request.get("always"):
                 row.addWidget(self.button(request["always"], "", {"action": "always"}))
-            row.addWidget(self.button("Keep planning" if plan else "Deny", "danger", {"action": "deny"}))
+            row.addWidget(self.button("Reject" if kimi else "Keep planning" if plan else "Deny",
+                                      "danger", {"action": "deny"}))
             row.addStretch(1)
             row.addWidget(self.button("Hide", "ghost", {"action": "defer"}))
             layout.addLayout(row)
@@ -539,7 +577,10 @@ class RequestCard(QFrame):
         answers = {q["question"]: ", ".join(self.choices[q["question"]]) for q in self.questions}
         self.send({"action": "answer", "answers": answers})
 
-    def send(self, answer):
+    def send(self, answer: dict) -> None:
+        if self.request.get("terminal_only"):
+            self.hide()
+            return
         send_answer(self.request["id"], dict(answer, id=self.request["id"]))
         self.setEnabled(False)
 
@@ -883,10 +924,10 @@ class Overlay(QWidget):
         self.sessions = load_sessions()
         self.limits = load_limits()
         self.tooltip = "\n".join(
-            f"{project_name(s)}: {self.config['labels'][s['status']]}"
+            f"{client_name(s)} · {project_name(s)}: {self.config['labels'][s['status']]}"
             + (f" ({s['tool']})" if s["status"] == "working" and s.get("tool") else "")
             for s in self.sessions
-        ) or "No Claude Code sessions"
+        ) or "No coding agent sessions"
         self.rebuild()
         return True
 
@@ -1000,7 +1041,7 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     lock = single_instance()
     if lock is None:
-        print("Claude overlay is already running", file=sys.stderr)
+        print("AI Code Overlay is already running", file=sys.stderr)
         return 1
 
     app = QApplication(sys.argv)

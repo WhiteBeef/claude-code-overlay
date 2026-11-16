@@ -1,4 +1,6 @@
 """Shared paths, config and process helpers for hook.py, statusline.py and overlay.py."""
+from __future__ import annotations
+
 import contextlib
 import copy
 import json
@@ -6,6 +8,8 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 try:
     import psutil
@@ -13,6 +17,7 @@ except ImportError:  # the overlay still works, it just can't tell when a sessio
     psutil = None
 
 BASE_DIR = os.environ.get("CLAUDE_OVERLAY_DIR") or os.path.join(os.path.expanduser("~"), ".claude", "overlay")
+KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME", str(Path.home() / ".kimi-code"))).expanduser()
 STATE_DIR = os.path.join(BASE_DIR, "state")
 ANSWER_DIR = os.path.join(BASE_DIR, "answers")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -21,14 +26,21 @@ LIMITS_PATH = os.path.join(BASE_DIR, "limits.json")
 HEARTBEAT_PATH = os.path.join(BASE_DIR, "overlay.alive")
 LOCK_PATH = os.path.join(BASE_DIR, "overlay.lock")
 
+CLIENT_LABELS = {"claude": "Claude", "kimi": "Kimi", "codex": "Codex"}
+CLIENT_PROCESS_NAMES = {
+    "claude": ("claude",),
+    "kimi": ("kimi", "kimi-code"),
+    "codex": ("codex",),
+}
+
 DEFAULT_CONFIG = {
     # "top": one pill with the most urgent session; "all": one pill per session
     "sessions": "top",
     # what the pill shows besides the status
     "show": {
         "project": False,     # project folder name ("all" mode always shows it)
-        "elapsed": True,      # turn duration / time since Claude stopped
-        "tool": True,         # tool Claude is running right now
+        "elapsed": True,      # turn duration / time since the agent stopped
+        "tool": True,         # tool the agent is running right now
         "five_hour": True,    # 5-hour plan limit, percent used
         "seven_day": False,   # weekly plan limit, percent used
         "reset_in": False,    # time until the 5-hour window resets
@@ -132,15 +144,15 @@ def file_lock(path):
                 fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def session_path(session_id):
-    return os.path.join(STATE_DIR, f"{session_id}.json")
+def session_path(session_id: str, client: str = "claude") -> str:
+    return os.path.join(STATE_DIR, f"{client}-{session_id}.json")
 
 
 @contextlib.contextmanager
-def update_session(session_id):
+def update_session(session_id: str, client: str = "claude"):
     """Read-modify-write a session's state file under its lock. Yields the state dict."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    path = session_path(session_id)
+    path = session_path(session_id, client)
     with file_lock(path[:-5] + ".lock"):
         state = read_json(path, {})
         yield state
@@ -150,6 +162,47 @@ def update_session(session_id):
                     os.remove(p)
         else:
             write_json(path, state)
+
+
+def find_kimi_transcript(session_id: str) -> Optional[str]:
+    sessions = KIMI_HOME / "sessions"
+    try:
+        return str(next(sessions.glob(f"*/{session_id}/agents/main/wire.jsonl")))
+    except (OSError, StopIteration):
+        return None
+
+
+_kimi_turn_cache = {}
+
+
+def last_kimi_turn_end(transcript: Optional[str]) -> float:
+    if not transcript:
+        return 0
+    try:
+        mtime = os.path.getmtime(transcript)
+        cached = _kimi_turn_cache.get(transcript)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        with open(transcript, "rb") as file:
+            file.seek(0, os.SEEK_END)
+            file.seek(max(0, file.tell() - 65536))
+            tail = file.read()
+    except OSError:
+        return 0
+    ended = 0
+    for line in reversed(tail.splitlines()):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        kind = entry.get("type")
+        if kind == "turn.ended":
+            ended = entry.get("time", 0) / 1000
+            break
+        if kind in ("context.append_loop_event", "context.append_message"):
+            break
+    _kimi_turn_cache[transcript] = (mtime, ended)
+    return ended
 
 
 # --- processes ---------------------------------------------------------------
@@ -172,24 +225,28 @@ def is_alive(pid, started):
     return actual is not None and isinstance(started, (int, float)) and abs(actual - started) < 1
 
 
-def is_claude(proc):
+def is_agent(proc: psutil.Process, client: str) -> bool:
     name = proc.name().lower()
-    if name in ("claude", "claude.exe"):
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name in CLIENT_PROCESS_NAMES[client]:
         return True
     if name.startswith("node"):
         argv = proc.cmdline()
-        return len(argv) > 1 and "claude" in argv[1].lower()
+        return len(argv) > 1 and any(
+            process_name in argv[1].lower() for process_name in CLIENT_PROCESS_NAMES[client]
+        )
     return False
 
 
-def find_claude_pid():
-    """Walk up the process tree to the Claude Code process that ran this hook."""
+def find_agent_pid(client: str = "claude"):
+    """Walk up the process tree to the coding agent process that ran this hook."""
     if psutil is None:
         return None, None
     try:
         proc = psutil.Process(os.getppid())
         for _ in range(8):
-            if is_claude(proc):
+            if is_agent(proc, client):
                 return proc.pid, proc.create_time()
             proc = proc.parent()
             if proc is None or proc.pid <= 1:
@@ -203,7 +260,7 @@ def has_busy_child(pid, after):
     """True if the process has a child started after `after` that has run for over a second.
 
     Covers the gap between approving a permission prompt and the tool finishing
-    (e.g. a long build), since Claude Code sends no hook event for an approval.
+    (e.g. a long build), since coding agents may not send an event for an approval.
     """
     if psutil is None:
         return False
